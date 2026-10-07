@@ -18,17 +18,19 @@ DB = BASE / "inscripciones.db"
 TZ = ZoneInfo("America/Panama")
 
 # ---------------------------------------------------------------- configuración
-# Cupo = jugadores por sesión. Duración en minutos. Edades permitidas (inclusive).
+# Cupo = jugadores por sesión (None = sin límite); quien reserva el mismo servicio a la misma hora se suma
+# a ese grupo hasta llenar el cupo. Duración en minutos. Edades permitidas (inclusive).
+# exclusivo=True: la primera reserva se queda con ese día y hora; nadie más puede reservar en ese horario.
 SERVICIOS = {
     "Polo Evaluación": dict(precio="$25", minutos=75, cupo=1, edades=(6, 18), color="#3DBA6A", texto="#0F2A4A",
                             desc="El primer paso: nivel, fortalezas y plan."),
-    "Polo 1:1": dict(precio="$45 por sesión", minutos=60, cupo=1, edades=(10, 18), color="#336FBF", texto="#FFFFFF",
+    "Polo 1:1": dict(precio="$45 por sesión", minutos=60, cupo=1, exclusivo=True, edades=(10, 18), color="#336FBF", texto="#FFFFFF",
                      desc="Entrenamiento individual de su posición."),
     "Polo Dúo": dict(precio="$30 por jugador", minutos=60, cupo=2, edades=(10, 18), color="#50A8E2", texto="#0F2A4A",
                      desc="Dos jugadores, misma sesión."),
-    "Polo Línea": dict(precio="$15 por jugador", minutos=75, cupo=8, edades=(10, 18), color="#0F2A4A", texto="#FFFFFF",
+    "Polo Línea": dict(precio="$15 por jugador", minutos=75, cupo=4, edades=(10, 18), color="#0F2A4A", texto="#FFFFFF",
                        desc="Grupo por posición."),
-    "Polo Base": dict(precio="$12", minutos=60, cupo=10, edades=(6, 9), color="#E3F5EA", texto="#0F2A4A",
+    "Polo Base": dict(precio="$12", minutos=60, cupo=None, edades=(6, 9), color="#E3F5EA", texto="#0F2A4A",
                       desc="6 a 9 años: juego y todas las posiciones."),
 }
 # Sesiones que pueden darse a la misma hora (una por entrenador disponible).
@@ -143,15 +145,19 @@ def sesiones(df):
     activas = df[df.estado != "Cancelada"]
     out = {}
     for r in activas.itertuples():
-        grupal = SERVICIOS.get(r.servicio, {}).get("cupo", 1) > 1
+        grupal = es_grupal(SERVICIOS.get(r.servicio, {}))
         clave = (r.servicio, r.fecha, r.hora) if grupal else ("id", r.id)
         s = out.setdefault(clave, dict(servicio=r.servicio, fecha=r.fecha, hora=r.hora, minutos=r.minutos, filas=[]))
         s["filas"].append(r)
     return list(out.values())
 
 
+def es_grupal(cfg):
+    return cfg.get("cupo", 1) != 1
+
+
 def disponibilidad(df, servicio, fecha):
-    """Devuelve [(hora, cupos_libres)] para el servicio en esa fecha."""
+    """Devuelve [(hora, cupos_libres)] para el servicio en esa fecha (None = sin límite)."""
     cfg = SERVICIOS[servicio]
     horas = HORARIOS_FIN_DE_SEMANA if fecha.weekday() >= 5 else HORARIOS_SEMANA
     del_dia = [s for s in sesiones(df) if s["fecha"] == fecha.isoformat()]
@@ -162,11 +168,18 @@ def disponibilidad(df, servicio, fecha):
             continue
         cruzan = [s for s in del_dia if inicio_fin(s["fecha"], s["hora"], s["minutos"])[0] < fin
                   and inicio_fin(s["fecha"], s["hora"], s["minutos"])[1] > ini]
-        misma = [s for s in cruzan if cfg["cupo"] > 1 and s["servicio"] == servicio and s["hora"] == h]
+        if any(SERVICIOS.get(s["servicio"], {}).get("exclusivo") for s in cruzan):
+            continue  # ya hay una clase exclusiva en ese horario
+        if cfg.get("exclusivo"):  # la clase exclusiva necesita el horario libre
+            if not cruzan:
+                libres.append((h, cfg["cupo"]))
+            continue
+        misma = [s for s in cruzan if es_grupal(cfg) and s["servicio"] == servicio and s["hora"] == h]
         if misma:  # se suma a un grupo que ya existe
-            quedan = cfg["cupo"] - len(misma[0]["filas"])
-            if quedan > 0:
-                libres.append((h, quedan))
+            if cfg["cupo"] is None:
+                libres.append((h, None))
+            elif cfg["cupo"] - len(misma[0]["filas"]) > 0:
+                libres.append((h, cfg["cupo"] - len(misma[0]["filas"])))
         elif len(cruzan) < SESIONES_SIMULTANEAS:
             libres.append((h, cfg["cupo"]))
     return libres
@@ -225,7 +238,7 @@ def pagina_inscripcion():
     libres = disponibilidad(leer(), servicio, fecha)
     cfg = SERVICIOS[servicio]
     if libres:
-        etiquetas = {h: (f"{h} · quedan {n} cupos" if cfg["cupo"] > 1 else h) for h, n in libres}
+        etiquetas = {h: ((f"{h} · queda 1 cupo" if n == 1 else f"{h} · quedan {n} cupos") if n and es_grupal(cfg) else h) for h, n in libres}
         hora = c3.selectbox("Hora", list(etiquetas), format_func=etiquetas.get)
     else:
         hora = None
@@ -327,7 +340,8 @@ def pagina_calendario():
         ini, fin = inicio_fin(s["fecha"], s["hora"], s["minutos"])
         nombres = ", ".join(r.jugador for r in s["filas"])
         pendiente = any(r.estado == "Pendiente" for r in s["filas"])
-        cupo = f" · {len(s['filas'])}/{cfg['cupo']}" if cfg["cupo"] > 1 else ""
+        n = len(s["filas"])
+        cupo = "" if not es_grupal(cfg) else (f" · {n}/{cfg['cupo']}" if cfg["cupo"] else f" · {n} jug.")
         eventos.append(dict(title=f"{'⏳ ' if pendiente else ''}{s['servicio']}{cupo} · {nombres}",
                             start=ini.isoformat(), end=fin.isoformat(), backgroundColor=cfg["color"],
                             borderColor=cfg["color"], textColor=cfg["texto"]))
